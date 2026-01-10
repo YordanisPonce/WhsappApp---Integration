@@ -155,12 +155,17 @@ async function getOrCreateClient(userId) {
         state.client = client;
 
         try {
-            // initialize kicks off puppeteer + session restore
-            client.initialize();
+            // initialize kicks off puppeteer + session restore (async)
+            await Promise.resolve(client.initialize());
         } catch (e) {
+            const msg = String(e?.message || e);
+
             state.status = "error";
-            state.lastError = String(e?.message || e);
-            try { client.destroy(); } catch (_) { }
+            state.lastError = msg;
+
+            // si el error es "browser already running", NO revientes el proceso.
+            // libera el client para que en el próximo poll se reintente.
+            try { await Promise.resolve(client.destroy()); } catch (_) { }
             state.client = null;
         }
     })();
@@ -282,3 +287,19 @@ app.listen(PORT, () => {
     console.log(`WhatsApp Gateway running on port ${PORT}`);
     console.log(`Sessions path: ${SESSIONS_PATH}`);
 });
+
+async function shutdown() {
+    console.log("Shutting down...");
+
+    for (const [userId, st] of clients.entries()) {
+        if (st?.client) {
+            try { await Promise.resolve(st.client.destroy()); } catch (_) { }
+            st.client = null;
+        }
+    }
+
+    process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
