@@ -50,10 +50,123 @@ const clients = new Map(); // userId -> { status, qrDataUrl, phone, lastError, c
 // userId -> init promise (single-flight)
 const initLocks = new Map();
 
+
+
+// funcion para limpiar 
+
+/**
+ * Cleanup robusto para perfiles de Chromium en Linux
+ * Mata procesos y elimina todos los archivos de bloqueo conocidos
+ */
+async function forceCleanupUserProfile(userId) {
+    const id = String(userId);
+
+    // 1. Identificar la ruta del perfil específico del usuario
+    const userProfileDir = path.join(SESSIONS_PATH, `.wwebjs_auth_${id}`, "session-user_" + id);
+
+    console.log(`[CLEANUP] Starting cleanup for user_${id} at: ${userProfileDir}`);
+
+    // 2. Buscar y matar procesos de Chrome/Chromium que usen este perfil
+    try {
+        // Método 1: Buscar por el directorio específico
+        const findPidsCmd = `ps aux | grep -E "(chrome|chromium).*${userProfileDir.replace(/[-\/]/g, '[-/]')}" | grep -v grep | awk '{print $2}'`;
+        const pids = execSync(findPidsCmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] })
+            .trim()
+            .split('\n')
+            .filter(pid => pid.trim().length > 0);
+
+        if (pids.length > 0) {
+            console.log(`[CLEANUP] Found processes for user_${id}: ${pids.join(', ')}`);
+
+            // Matar procesos gradualmente
+            for (const pid of pids) {
+                try {
+                    // SIGTERM primero
+                    process.kill(pid, 'SIGTERM');
+                    console.log(`[CLEANUP] Sent SIGTERM to PID ${pid}`);
+                } catch (e) {
+                    // Si no existe, continuar
+                }
+            }
+
+            // Esperar un poco
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Verificar y matar con SIGKILL si aún existen
+            for (const pid of pids) {
+                try {
+                    process.kill(pid, 0); // Verifica si el proceso existe
+                    process.kill(pid, 'SIGKILL');
+                    console.log(`[CLEANUP] Sent SIGKILL to PID ${pid}`);
+                } catch (e) {
+                    // Proceso ya terminado
+                }
+            }
+        }
+    } catch (error) {
+        // Ignorar errores en los comandos
+    }
+
+    // 3. Matar cualquier proceso de chrome/chromium del usuario actual
+    try {
+        execSync('pkill -9 -f "chrome" || pkill -9 -f "chromium" || true',
+            { stdio: 'ignore', uid: process.getuid() });
+    } catch (_) { }
+
+    // 4. Limpiar archivos de bloqueo específicos del directorio
+    if (fs.existsSync(userProfileDir)) {
+        const lockFiles = [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            "DevToolsActivePort",
+            "SingletonLock-random",
+            "puppeteer_dev_profile-*/SingletonLock"
+        ];
+
+        for (const lockFile of lockFiles) {
+            try {
+                const lockPath = path.join(userProfileDir, lockFile);
+                if (fs.existsSync(lockPath)) {
+                    fs.unlinkSync(lockPath);
+                    console.log(`[CLEANUP] Removed lock file: ${lockPath}`);
+                }
+            } catch (_) { }
+        }
+
+        // 5. También buscar y eliminar archivos de bloqueo en subdirectorios
+        try {
+            const findLockCmd = `find "${userProfileDir}" -name "*Lock*" -o -name "*Singleton*" -o -name "*ActivePort*" 2>/dev/null`;
+            const locks = execSync(findLockCmd, { encoding: 'utf8' }).trim().split('\n');
+
+            for (const lock of locks) {
+                if (lock && fs.existsSync(lock)) {
+                    try {
+                        fs.unlinkSync(lock);
+                        console.log(`[CLEANUP] Removed: ${lock}`);
+                    } catch (_) { }
+                }
+            }
+        } catch (_) { }
+    }
+
+    // 6. Limpiar puertos colgantes
+    try {
+        // Buscar puertos de DevTools que puedan estar abiertos
+        execSync('lsof -ti:9222-9333 | xargs kill -9 2>/dev/null || true', { stdio: 'ignore' });
+    } catch (_) { }
+
+    await new Promise(resolve => setTimeout(resolve, 500));
+    console.log(`[CLEANUP] Completed cleanup for user_${id}`);
+}
+// end de la funcion para limpiar procesos
+
+
 function requireKey(req, res, next) {
     const key = req.header("X-API-Key");
     if (!API_KEY || key !== API_KEY) {
         return res.status(401).json({ ok: false, error: "Unauthorized" });
+
     }
     next();
 }
@@ -150,6 +263,11 @@ async function getOrCreateClient(userId) {
 
     const initPromise = (async () => {
         ensureSessionsPath();
+
+        // LIMPIEZA PREVIA OBLIGATORIA EN LINUX
+        if (process.platform === 'linux') {
+            await forceCleanupUserProfile(id);
+        }
 
         state.status = "starting";
         state.qrDataUrl = null;
