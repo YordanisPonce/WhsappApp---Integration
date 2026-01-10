@@ -196,6 +196,7 @@ app.post("/sessions/:userId/start", requireKey, async (req, res) => {
  *    Frontend polls until status === "ready"
  */
 app.get("/sessions/:userId/qr", requireKey, async (req, res) => {
+    console.log("[QR request] userId =", req.params.userId);
     const { userId } = req.params;
     await getOrCreateClient(userId);
     const st = ensureState(userId);
