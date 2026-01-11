@@ -479,6 +479,16 @@ app.post("/sessions/:userId/logout", requireKey, async (req, res) => {
     st.lastError = null;
     touch(st);
 
+    try {
+        const command = 'pm2 restart whatsapp';
+        const output = execSync(command, {
+            encoding: 'utf-8',
+            stdio: 'pipe' // Esto captura la salida
+        });
+    } catch (error) {
+
+    }
+
     res.json({ ok: true });
 });
 
