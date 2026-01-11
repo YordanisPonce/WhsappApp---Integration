@@ -200,7 +200,7 @@ function touch(st) {
 
 function buildPuppeteerOpts() {
     const puppeteerOpts = {
-        headless: "new", // tends to be more stable on modern chromium
+        headless: true, // tends to be more stable on modern chromium
         args: [
             "--no-sandbox",
             "--disable-setuid-sandbox",
