@@ -200,7 +200,7 @@ function touch(st) {
 
 function buildPuppeteerOpts() {
     const puppeteerOpts = {
-        headless: "new", // tends to be more stable on modern chromium
+        headless: true, // tends to be more stable on modern chromium
         args: [
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -263,12 +263,6 @@ async function getOrCreateClient(userId) {
 
     const initPromise = (async () => {
         ensureSessionsPath();
-
-        // LIMPIEZA PREVIA OBLIGATORIA EN LINUX
-        if (process.platform === 'linux') {
-           // await forceCleanupUserProfile(id);
-        }
-
         state.status = "starting";
         state.qrDataUrl = null;
         state.phone = null;
