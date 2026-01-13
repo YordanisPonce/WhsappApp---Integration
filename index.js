@@ -1,10 +1,11 @@
 /**
- * WhatsApp Gateway (multi-user) - Baileys (ESM)
- * ✅ Multi-user sessions (auth state per user)
- * ✅ QR as DataURL for frontend
- * ✅ Status endpoint
- * ✅ Send message endpoint
- * ✅ Logout endpoint (delete session folder)
+ * WhatsApp Gateway (multi-user) - Baileys (ESM) - STABLE
+ *
+ * ✅ Multi-user sessions: sessions/user_<USER_ID>/
+ * ✅ QR as DataURL
+ * ✅ Start / QR / Status / Send / Logout
+ * ✅ Auto-reconnect (handles restartRequired, connectionClosed, timedOut, 515)
+ * ✅ Creates the folder automatically
  *
  * ENV:
  *  - PORT=3005
@@ -34,12 +35,13 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3005);
-const API_KEY = process.env.API_KEY || "";
+const API_KEY = (process.env.API_KEY || "").trim();
 
 const SESSIONS_PATH = process.env.SESSIONS_PATH
     ? path.resolve(process.env.SESSIONS_PATH)
     : path.join(__dirname, "sessions");
 
+// userId -> state
 const clients = new Map(); // userId -> { status, qrDataUrl, phone, lastError, sock, lastUsedAt }
 const initLocks = new Map(); // userId -> Promise
 
@@ -51,8 +53,12 @@ function requireKey(req, res, next) {
     next();
 }
 
+function ensureDir(dir) {
+    fs.mkdirSync(dir, { recursive: true });
+}
+
 function ensureSessionsPath() {
-    fs.mkdirSync(SESSIONS_PATH, { recursive: true });
+    ensureDir(SESSIONS_PATH);
 }
 
 function userSessionDir(userId) {
@@ -78,6 +84,31 @@ function touch(st) {
     st.lastUsedAt = Date.now();
 }
 
+function normalizePhoneFromBaileysId(rawId) {
+    // "5358212822:68@s.whatsapp.net" -> "5358212822"
+    if (!rawId) return null;
+    const s = String(rawId);
+    return s.split(":")[0] || null;
+}
+
+/**
+ * Decide if we should auto-reconnect
+ */
+function shouldReconnect(statusCode) {
+    // Baileys uses DisconnectReason.*
+    // 515 usually appears as "restart required" / transient.
+    const retryables = new Set([
+        DisconnectReason.restartRequired,
+        DisconnectReason.timedOut,
+        DisconnectReason.connectionClosed,
+        DisconnectReason.connectionLost,
+        DisconnectReason.badSession,
+        DisconnectReason.multideviceMismatch,
+    ]);
+
+    return retryables.has(statusCode);
+}
+
 async function getOrCreateClient(userId) {
     const id = String(userId);
     const st = ensureState(id);
@@ -85,6 +116,7 @@ async function getOrCreateClient(userId) {
 
     if (st.sock) return st.sock;
 
+    // single-flight init
     if (initLocks.has(id)) {
         await initLocks.get(id);
         return ensureState(id).sock;
@@ -97,65 +129,103 @@ async function getOrCreateClient(userId) {
         st.phone = null;
         st.lastError = null;
 
-        const dir = userSessionDir(id);
-        fs.mkdirSync(dir, { recursive: true });
+        // ✅ create per-user auth folder
+        const authDir = userSessionDir(id);
+        ensureDir(authDir);
 
-        const { state, saveCreds } = await useMultiFileAuthState(dir);
+        console.log(`[AUTH] userId=${id}`);
+        console.log(`[AUTH] authDir=${authDir}`);
+
+        const { state, saveCreds } = await useMultiFileAuthState(authDir);
         const { version } = await fetchLatestBaileysVersion();
 
         const sock = makeWASocket({
             version,
             auth: state,
-            printQRInTerminal: false, // nosotros lo devolvemos al frontend
+            printQRInTerminal: false,
             syncFullHistory: false,
             markOnlineOnConnect: false,
+            // browser identity (optional)
+            // browser: Browsers.macOS("Chrome"),
         });
 
         st.sock = sock;
 
+        // ✅ MUST save creds
         sock.ev.on("creds.update", saveCreds);
 
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                st.status = "qr";
-                st.qrDataUrl = await qrcode.toDataURL(qr);
-                touch(st);
+                try {
+                    st.status = "qr";
+                    st.qrDataUrl = await qrcode.toDataURL(qr);
+                    st.lastError = null;
+                    touch(st);
+                } catch (e) {
+                    st.status = "error";
+                    st.lastError = String(e?.message || e);
+                    touch(st);
+                }
             }
 
             if (connection === "open") {
                 st.status = "ready";
                 st.qrDataUrl = null;
+                st.lastError = null;
 
-                // Baileys: sock.user?.id ejemplo: "5358830083:12@s.whatsapp.net"
-                const raw = sock.user?.id || null;
-                st.phone = raw ? String(raw).split(":")[0] : null;
-
+                st.phone = normalizePhoneFromBaileysId(sock.user?.id);
                 touch(st);
+
+                console.log(`[READY] user_${id} phone=${st.phone || "-"}`);
             }
 
             if (connection === "close") {
-                const code =
+                const statusCode =
                     lastDisconnect?.error?.output?.statusCode ||
-                    lastDisconnect?.error?.statusCode;
+                    lastDisconnect?.error?.statusCode ||
+                    null;
+
+                const reason =
+                    statusCode !== null ? `code=${statusCode}` : "code=unknown";
 
                 st.status = "disconnected";
                 st.qrDataUrl = null;
                 st.phone = null;
-                st.lastError = `disconnected: ${code || "unknown"}`;
+                st.lastError = `disconnected: ${reason}`;
                 touch(st);
 
-                // si se deslogueó: credenciales inválidas -> limpiar y forzar nuevo QR
-                if (code === DisconnectReason.loggedOut) {
+                console.log(`[DISCONNECTED] user_${id} ${reason}`);
+
+                // ✅ LOGGED OUT => clear folder (forces fresh QR)
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log(`[LOGGED_OUT] Clearing authDir: ${authDir}`);
                     try {
-                        fs.rmSync(dir, { recursive: true, force: true });
+                        fs.rmSync(authDir, { recursive: true, force: true });
                     } catch (_) { }
+                    st.sock = null;
+                    return;
                 }
 
-                try {
-                    st.sock?.end?.();
-                } catch (_) { }
+                // ✅ retryable disconnect => reconnect after a small delay
+                if (statusCode !== null && shouldReconnect(statusCode)) {
+                    st.sock = null; // force new init
+                    setTimeout(() => {
+                        // fire-and-forget reconnect
+                        getOrCreateClient(id).catch((err) => {
+                            const msg = String(err?.message || err);
+                            console.log(`[RECONNECT_ERROR] user_${id}: ${msg}`);
+                            const st2 = ensureState(id);
+                            st2.status = "error";
+                            st2.lastError = msg;
+                            st2.sock = null;
+                        });
+                    }, 1500);
+                    return;
+                }
+
+                // Non-retryable => keep error
                 st.sock = null;
             }
         });
@@ -185,7 +255,7 @@ app.post("/sessions/:userId/start", requireKey, async (req, res) => {
 });
 
 /**
- * 2) Get QR (polling from frontend)
+ * 2) Get QR (polling)
  */
 app.get("/sessions/:userId/qr", requireKey, async (req, res) => {
     const { userId } = req.params;
@@ -195,7 +265,7 @@ app.get("/sessions/:userId/qr", requireKey, async (req, res) => {
     res.json({
         ok: true,
         status: st.status,
-        qr: st.qrDataUrl,
+        qr: st.qrDataUrl, // data:image/png;base64,...
         phone: st.phone,
         error: st.lastError,
     });
@@ -226,7 +296,10 @@ app.post("/sessions/:userId/send", requireKey, async (req, res) => {
     const { to, message } = req.body || {};
 
     if (!to || !message) {
-        return res.status(422).json({ ok: false, error: "to and message are required" });
+        return res.status(422).json({
+            ok: false,
+            error: "to and message are required",
+        });
     }
 
     await getOrCreateClient(userId);
@@ -238,12 +311,15 @@ app.post("/sessions/:userId/send", requireKey, async (req, res) => {
             ok: false,
             error: "WhatsApp not connected",
             status: st.status,
+            detail: st.lastError,
         });
     }
 
     try {
         const clean = String(to).replace(/\D/g, "");
-        const jid = clean.includes("@s.whatsapp.net") ? clean : `${clean}@s.whatsapp.net`;
+        const jid = clean.includes("@s.whatsapp.net")
+            ? clean
+            : `${clean}@s.whatsapp.net`;
 
         await st.sock.sendMessage(jid, { text: String(message) });
         res.json({ ok: true });
@@ -271,7 +347,7 @@ app.post("/sessions/:userId/logout", requireKey, async (req, res) => {
     st.lastError = null;
     touch(st);
 
-    // borrar sesión
+    // delete user folder => new QR next time
     try {
         fs.rmSync(userSessionDir(id), { recursive: true, force: true });
     } catch (_) { }
