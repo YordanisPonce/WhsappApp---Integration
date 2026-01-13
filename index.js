@@ -266,7 +266,7 @@ async function getOrCreateClient(userId) {
 
         // LIMPIEZA PREVIA OBLIGATORIA EN LINUX
         if (process.platform === 'linux') {
-            await forceCleanupUserProfile(id);
+          //  await forceCleanupUserProfile(id);
         }
 
         state.status = "starting";
