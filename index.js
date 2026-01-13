@@ -1,30 +1,33 @@
 /**
- * WhatsApp Gateway (multi-user) - PRO + STABLE
- *
- * ✅ Multi-user via LocalAuth(clientId=user_<id>)
+ * WhatsApp Gateway (multi-user) - Baileys (ESM)
+ * ✅ Multi-user sessions (auth state per user)
  * ✅ QR as DataURL for frontend
- * ✅ Per-user init lock (prevents double init under polling)
- * ✅ Auto-recover from "browser already running" (kills stray chromium + clears lockfiles + retries once)
- * ✅ Graceful shutdown (SIGTERM/SIGINT) to avoid zombie chromium
- * ✅ Idle TTL (auto-destroy inactive clients to keep RAM stable for 10–50 users)
+ * ✅ Status endpoint
+ * ✅ Send message endpoint
+ * ✅ Logout endpoint (delete session folder)
  *
  * ENV:
  *  - PORT=3005
  *  - API_KEY=super-secret
- *  - SESSIONS_PATH=/absolute/path/to/sessions   (recommended)
- *  - CHROME_BIN=/usr/bin/chromium-browser       (optional; only used if exists)
- *  - IDLE_TTL_MINUTES=15                        (optional; default 15)
+ *  - SESSIONS_PATH=/absolute/path/to/sessions
  */
 
-require("dotenv").config();
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import qrcode from "qrcode";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const express = require("express");
-const cors = require("cors");
-const qrcode = require("qrcode");
-const fs = require("fs");
-const path = require("path");
-const { execSync } = require("child_process");
-const { Client, LocalAuth } = require("whatsapp-web.js");
+import makeWASocket, {
+    DisconnectReason,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+} from "@whiskeysockets/baileys";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
@@ -33,150 +36,27 @@ app.use(express.json());
 const PORT = Number(process.env.PORT || 3005);
 const API_KEY = process.env.API_KEY || "";
 
-// Prefer absolute sessions path for stability
 const SESSIONS_PATH = process.env.SESSIONS_PATH
     ? path.resolve(process.env.SESSIONS_PATH)
     : path.join(__dirname, "sessions");
 
-// Optional Chrome path
-const CHROME_BIN = (process.env.CHROME_BIN || "").trim();
-
-// Idle TTL to avoid keeping 50 chromiums always alive
-const IDLE_TTL_MINUTES = Number(process.env.IDLE_TTL_MINUTES || 15);
-const IDLE_TTL_MS = Math.max(1, IDLE_TTL_MINUTES) * 60 * 1000;
-
-// userId -> state
-const clients = new Map(); // userId -> { status, qrDataUrl, phone, lastError, client, lastUsedAt }
-// userId -> init promise (single-flight)
-const initLocks = new Map();
-
-
-
-// funcion para limpiar 
-
-/**
- * Cleanup robusto para perfiles de Chromium en Linux
- * Mata procesos y elimina todos los archivos de bloqueo conocidos
- */
-async function forceCleanupUserProfile(userId) {
-    const id = String(userId);
-
-    // 1. Identificar la ruta del perfil específico del usuario
-    const userProfileDir = path.join(SESSIONS_PATH, `.wwebjs_auth_${id}`, "session-user_" + id);
-
-    console.log(`[CLEANUP] Starting cleanup for user_${id} at: ${userProfileDir}`);
-
-    // 2. Buscar y matar procesos de Chrome/Chromium que usen este perfil
-    try {
-        // Método 1: Buscar por el directorio específico
-        const findPidsCmd = `ps aux | grep -E "(chrome|chromium).*${userProfileDir.replace(/[-\/]/g, '[-/]')}" | grep -v grep | awk '{print $2}'`;
-        const pids = execSync(findPidsCmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] })
-            .trim()
-            .split('\n')
-            .filter(pid => pid.trim().length > 0);
-
-        if (pids.length > 0) {
-            console.log(`[CLEANUP] Found processes for user_${id}: ${pids.join(', ')}`);
-
-            // Matar procesos gradualmente
-            for (const pid of pids) {
-                try {
-                    // SIGTERM primero
-                    process.kill(pid, 'SIGTERM');
-                    console.log(`[CLEANUP] Sent SIGTERM to PID ${pid}`);
-                } catch (e) {
-                    // Si no existe, continuar
-                }
-            }
-
-            // Esperar un poco
-            await new Promise(resolve => setTimeout(resolve, 1000));
-
-            // Verificar y matar con SIGKILL si aún existen
-            for (const pid of pids) {
-                try {
-                    process.kill(pid, 0); // Verifica si el proceso existe
-                    process.kill(pid, 'SIGKILL');
-                    console.log(`[CLEANUP] Sent SIGKILL to PID ${pid}`);
-                } catch (e) {
-                    // Proceso ya terminado
-                }
-            }
-        }
-    } catch (error) {
-        // Ignorar errores en los comandos
-    }
-
-    // 3. Matar cualquier proceso de chrome/chromium del usuario actual
-    try {
-        execSync('pkill -9 -f "chrome" || pkill -9 -f "chromium" || true',
-            { stdio: 'ignore', uid: process.getuid() });
-    } catch (_) { }
-
-    // 4. Limpiar archivos de bloqueo específicos del directorio
-    if (fs.existsSync(userProfileDir)) {
-        const lockFiles = [
-            "SingletonLock",
-            "SingletonSocket",
-            "SingletonCookie",
-            "DevToolsActivePort",
-            "SingletonLock-random",
-            "puppeteer_dev_profile-*/SingletonLock"
-        ];
-
-        for (const lockFile of lockFiles) {
-            try {
-                const lockPath = path.join(userProfileDir, lockFile);
-                if (fs.existsSync(lockPath)) {
-                    fs.unlinkSync(lockPath);
-                    console.log(`[CLEANUP] Removed lock file: ${lockPath}`);
-                }
-            } catch (_) { }
-        }
-
-        // 5. También buscar y eliminar archivos de bloqueo en subdirectorios
-        try {
-            const findLockCmd = `find "${userProfileDir}" -name "*Lock*" -o -name "*Singleton*" -o -name "*ActivePort*" 2>/dev/null`;
-            const locks = execSync(findLockCmd, { encoding: 'utf8' }).trim().split('\n');
-
-            for (const lock of locks) {
-                if (lock && fs.existsSync(lock)) {
-                    try {
-                        fs.unlinkSync(lock);
-                        console.log(`[CLEANUP] Removed: ${lock}`);
-                    } catch (_) { }
-                }
-            }
-        } catch (_) { }
-    }
-
-    // 6. Limpiar puertos colgantes
-    try {
-        // Buscar puertos de DevTools que puedan estar abiertos
-        execSync('lsof -ti:9222-9333 | xargs kill -9 2>/dev/null || true', { stdio: 'ignore' });
-    } catch (_) { }
-
-    await new Promise(resolve => setTimeout(resolve, 500));
-    console.log(`[CLEANUP] Completed cleanup for user_${id}`);
-}
-// end de la funcion para limpiar procesos
-
+const clients = new Map(); // userId -> { status, qrDataUrl, phone, lastError, sock, lastUsedAt }
+const initLocks = new Map(); // userId -> Promise
 
 function requireKey(req, res, next) {
     const key = req.header("X-API-Key");
     if (!API_KEY || key !== API_KEY) {
         return res.status(401).json({ ok: false, error: "Unauthorized" });
-
     }
     next();
 }
 
 function ensureSessionsPath() {
-    try {
-        fs.mkdirSync(SESSIONS_PATH, { recursive: true });
-    } catch (e) {
-        console.error("[SESSIONS_PATH] cannot create:", SESSIONS_PATH, e?.message || e);
-    }
+    fs.mkdirSync(SESSIONS_PATH, { recursive: true });
+}
+
+function userSessionDir(userId) {
+    return path.join(SESSIONS_PATH, `user_${String(userId)}`);
 }
 
 function ensureState(userId) {
@@ -187,7 +67,7 @@ function ensureState(userId) {
             qrDataUrl: null,
             phone: null,
             lastError: null,
-            client: null,
+            sock: null,
             lastUsedAt: Date.now(),
         });
     }
@@ -198,175 +78,89 @@ function touch(st) {
     st.lastUsedAt = Date.now();
 }
 
-function buildPuppeteerOpts() {
-    const puppeteerOpts = {
-        headless: "new", // tends to be more stable on modern chromium
-        args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
-    };
-
-    if (CHROME_BIN.length > 0) {
-        if (fs.existsSync(CHROME_BIN)) {
-            puppeteerOpts.executablePath = CHROME_BIN;
-        } else {
-            console.warn(`[CHROME_BIN] not found: ${CHROME_BIN}. Using default browser.`);
-        }
-    }
-
-    return puppeteerOpts;
-}
-
-function extractAlreadyRunningDir(msg) {
-    // "The browser is already running for /path/session-user_71. Use a different `userDataDir` ..."
-    const m = String(msg).match(/already running for (.*)\. Use a different/);
-    return m?.[1]?.trim() || null;
-}
-
-function cleanupChromeProfileDir(dir) {
-    if (!dir) return;
-
-    // 1) Kill any stray chromium that references this profile dir
-    try {
-        execSync(`pkill -f "${dir.replace(/"/g, '\\"')}" || true`, { stdio: "ignore" });
-    } catch (_) { }
-
-    // 2) Remove common lock files that can remain even when process is gone
-    const lockFiles = ["SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"];
-    for (const f of lockFiles) {
-        try {
-            fs.rmSync(path.join(dir, f), { force: true });
-        } catch (_) { }
-    }
-}
-
-/**
- * Create or return a Client for userId.
- * - per-user init lock prevents double init
- * - auto-recovery from "already running"
- */
 async function getOrCreateClient(userId) {
     const id = String(userId);
-    const state = ensureState(id);
-    touch(state);
+    const st = ensureState(id);
+    touch(st);
 
-    if (state.client) return state.client;
+    if (st.sock) return st.sock;
 
-    // If another request is initializing this user, wait for it
     if (initLocks.has(id)) {
         await initLocks.get(id);
-        return ensureState(id).client;
+        return ensureState(id).sock;
     }
 
     const initPromise = (async () => {
         ensureSessionsPath();
+        st.status = "starting";
+        st.qrDataUrl = null;
+        st.phone = null;
+        st.lastError = null;
 
-        // LIMPIEZA PREVIA OBLIGATORIA EN LINUX
-        if (process.platform === 'linux') {
-          //  await forceCleanupUserProfile(id);
-        }
+        const dir = userSessionDir(id);
+        fs.mkdirSync(dir, { recursive: true });
 
-        state.status = "starting";
-        state.qrDataUrl = null;
-        state.phone = null;
-        state.lastError = null;
+        const { state, saveCreds } = await useMultiFileAuthState(dir);
+        const { version } = await fetchLatestBaileysVersion();
 
-        const puppeteerOpts = buildPuppeteerOpts();
-
-        const client = new Client({
-            authStrategy: new LocalAuth({
-                clientId: `user_${id}`,
-                dataPath: SESSIONS_PATH,
-            }),
-            puppeteer: puppeteerOpts,
+        const sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false, // nosotros lo devolvemos al frontend
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
         });
 
-        client.on("qr", async (qr) => {
-            try {
-                state.status = "qr";
-                state.qrDataUrl = await qrcode.toDataURL(qr);
-                touch(state);
-            } catch (e) {
-                state.status = "error";
-                state.lastError = String(e?.message || e);
+        st.sock = sock;
+
+        sock.ev.on("creds.update", saveCreds);
+
+        sock.ev.on("connection.update", async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                st.status = "qr";
+                st.qrDataUrl = await qrcode.toDataURL(qr);
+                touch(st);
             }
-        });
 
-        client.on("ready", async () => {
-            state.status = "ready";
-            state.qrDataUrl = null;
-            touch(state);
+            if (connection === "open") {
+                st.status = "ready";
+                st.qrDataUrl = null;
 
-            try {
-                // try a couple of fields depending on lib versions
-                const wid = client.info?.wid;
-                state.phone =
-                    (wid && (wid.user || wid._serialized)) ||
-                    client.info?.me?.user ||
-                    null;
+                // Baileys: sock.user?.id ejemplo: "5358830083:12@s.whatsapp.net"
+                const raw = sock.user?.id || null;
+                st.phone = raw ? String(raw).split(":")[0] : null;
 
-                if (state.phone && String(state.phone).includes("@")) {
-                    // normalize: "5358830083@c.us" -> "5358830083"
-                    state.phone = String(state.phone).split("@")[0];
+                touch(st);
+            }
+
+            if (connection === "close") {
+                const code =
+                    lastDisconnect?.error?.output?.statusCode ||
+                    lastDisconnect?.error?.statusCode;
+
+                st.status = "disconnected";
+                st.qrDataUrl = null;
+                st.phone = null;
+                st.lastError = `disconnected: ${code || "unknown"}`;
+                touch(st);
+
+                // si se deslogueó: credenciales inválidas -> limpiar y forzar nuevo QR
+                if (code === DisconnectReason.loggedOut) {
+                    try {
+                        fs.rmSync(dir, { recursive: true, force: true });
+                    } catch (_) { }
                 }
-            } catch (_) { }
-        });
 
-        client.on("auth_failure", (msg) => {
-            state.status = "error";
-            state.lastError = `auth_failure: ${msg}`;
-        });
-
-        client.on("disconnected", async (reason) => {
-            state.status = "disconnected";
-            state.qrDataUrl = null;
-            state.phone = null;
-            state.lastError = `disconnected: ${reason}`;
-            touch(state);
-
-            try { await Promise.resolve(client.destroy()); } catch (_) { }
-            state.client = null; // force re-init (new QR)
-        });
-
-        state.client = client;
-
-        // Initialize with auto-recovery if profile is locked
-        try {
-            await Promise.resolve(client.initialize());
-        } catch (e) {
-            const msg = String(e?.message || e);
-            console.error(`[INIT ERROR] user_${id}:`, msg);
-
-            if (msg.includes("already running for")) {
-                const dir = extractAlreadyRunningDir(msg);
-                cleanupChromeProfileDir(dir);
-
-                // Retry once
                 try {
-                    await Promise.resolve(client.initialize());
-                    return;
-                } catch (e2) {
-                    const msg2 = String(e2?.message || e2);
-                    console.error(`[INIT ERROR RETRY] user_${id}:`, msg2);
-
-                    state.status = "error";
-                    state.lastError = msg2;
-
-                    try { await Promise.resolve(client.destroy()); } catch (_) { }
-                    state.client = null;
-                    return;
-                }
+                    st.sock?.end?.();
+                } catch (_) { }
+                st.sock = null;
             }
+        });
 
-            state.status = "error";
-            state.lastError = msg;
-
-            try { await Promise.resolve(client.destroy()); } catch (_) { }
-            state.client = null;
-        }
+        return sock;
     })();
 
     initLocks.set(id, initPromise);
@@ -377,11 +171,11 @@ async function getOrCreateClient(userId) {
         initLocks.delete(id);
     }
 
-    return ensureState(id).client;
+    return ensureState(id).sock;
 }
 
 /**
- * 1) Start / ensure session
+ * 1) Start session
  */
 app.post("/sessions/:userId/start", requireKey, async (req, res) => {
     const { userId } = req.params;
@@ -391,20 +185,17 @@ app.post("/sessions/:userId/start", requireKey, async (req, res) => {
 });
 
 /**
- * 2) Get QR (DataURL) for frontend
+ * 2) Get QR (polling from frontend)
  */
 app.get("/sessions/:userId/qr", requireKey, async (req, res) => {
     const { userId } = req.params;
-
-    console.log("[QR request] userId =", userId);
-
     await getOrCreateClient(userId);
     const st = ensureState(userId);
 
     res.json({
         ok: true,
         status: st.status,
-        qr: st.qrDataUrl, // data:image/png;base64,...
+        qr: st.qrDataUrl,
         phone: st.phone,
         error: st.lastError,
     });
@@ -442,7 +233,7 @@ app.post("/sessions/:userId/send", requireKey, async (req, res) => {
     const st = ensureState(userId);
     touch(st);
 
-    if (st.status !== "ready" || !st.client) {
+    if (st.status !== "ready" || !st.sock) {
         return res.status(409).json({
             ok: false,
             error: "WhatsApp not connected",
@@ -451,11 +242,10 @@ app.post("/sessions/:userId/send", requireKey, async (req, res) => {
     }
 
     try {
-        const chatId = String(to).includes("@c.us")
-            ? String(to)
-            : `${String(to).replace(/\D/g, "")}@c.us`;
+        const clean = String(to).replace(/\D/g, "");
+        const jid = clean.includes("@s.whatsapp.net") ? clean : `${clean}@s.whatsapp.net`;
 
-        await st.client.sendMessage(chatId, String(message));
+        await st.sock.sendMessage(jid, { text: String(message) });
         res.json({ ok: true });
     } catch (e) {
         res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -463,79 +253,33 @@ app.post("/sessions/:userId/send", requireKey, async (req, res) => {
 });
 
 /**
- * 5) Logout (force new QR)
+ * 5) Logout (delete session folder to force new QR)
  */
 app.post("/sessions/:userId/logout", requireKey, async (req, res) => {
     const { userId } = req.params;
-    const st = ensureState(userId);
+    const id = String(userId);
+    const st = ensureState(id);
 
-    try { if (st.client) await Promise.resolve(st.client.logout()); } catch (_) { }
-    try { if (st.client) await Promise.resolve(st.client.destroy()); } catch (_) { }
+    try {
+        st.sock?.end?.();
+    } catch (_) { }
 
-    st.client = null;
+    st.sock = null;
     st.status = "idle";
     st.qrDataUrl = null;
     st.phone = null;
     st.lastError = null;
     touch(st);
 
+    // borrar sesión
     try {
-        const command = 'pm2 restart whatsapp';
-        const output = execSync(command, {
-            encoding: 'utf-8',
-            stdio: 'pipe' // Esto captura la salida
-        });
-    } catch (error) {
-
-    }
+        fs.rmSync(userSessionDir(id), { recursive: true, force: true });
+    } catch (_) { }
 
     res.json({ ok: true });
 });
 
-/**
- * Background sweep: destroy inactive clients to keep server stable
- * - Keeps auth data on disk, so next init restores without QR (if session still valid)
- */
-setInterval(async () => {
-    const now = Date.now();
-
-    for (const [userId, st] of clients.entries()) {
-        if (!st?.client) continue;
-        if (st.status !== "ready") continue;
-
-        const idleMs = now - (st.lastUsedAt || now);
-        if (idleMs < IDLE_TTL_MS) continue;
-
-        console.log(`[TTL] Destroying inactive client user_${userId} (idle ${Math.round(idleMs / 1000)}s)`);
-
-        try { await Promise.resolve(st.client.destroy()); } catch (_) { }
-        st.client = null;
-        st.status = "idle";
-        st.qrDataUrl = null;
-        // Keep phone if you want; I reset it to be accurate after reconnect
-        st.phone = null;
-        st.lastError = null;
-    }
-}, 60 * 1000);
-
 app.listen(PORT, () => {
-    console.log(`WhatsApp Gateway running on port ${PORT}`);
+    console.log(`Baileys WhatsApp Gateway running on port ${PORT}`);
     console.log(`Sessions path: ${SESSIONS_PATH}`);
-    console.log(`Idle TTL: ${IDLE_TTL_MINUTES} minutes`);
 });
-
-async function shutdown() {
-    console.log("Shutting down...");
-
-    for (const st of clients.values()) {
-        if (st?.client) {
-            try { await Promise.resolve(st.client.destroy()); } catch (_) { }
-            st.client = null;
-        }
-    }
-
-    process.exit(0);
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
